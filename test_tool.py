@@ -46,8 +46,8 @@ OPENSKY_AUTH_URL: str = "https://auth.opensky-network.org/auth/realms/opensky-ne
 OPENSKY_API_BASE: str = "https://opensky-network.org/api"
 OPENSKY_CACHE_DIR: Path = CACHE_DIR / "opensky"
 OPENSKY_TOKEN_EXPIRY_BUFFER_SEC: int = 60
-OPENSKY_MAX_RETRIES: int = 4  # retries on HTTP 429 (rate limit) with backoff
-OPENSKY_MAX_BACKOFF_SEC: int = 30  # cap per-retry sleep
+OPENSKY_MAX_RETRIES: int = 3  # attempts on HTTP 429 (rate limit); kept low so a throttled airport fails fast for interactive queries
+OPENSKY_MAX_BACKOFF_SEC: int = 6  # cap per-retry sleep (seconds)
 OPENSKY_MAX_WORKERS: int = 10  # max concurrent OpenSky chunk fetches (bounds rate-limit pressure)
 RANK_GROWTH_TOP_K: int = 8  # rank_region computes the 90-day Growth baseline only for the top-K busiest candidates
 STABLE_WINDOW_LAG_DAYS: int = 2
@@ -173,12 +173,14 @@ def _opensky_get(endpoint: str, params: Dict[str, Any]) -> requests.Response:
             continue
 
         if response.status_code == 429:
-            retry_after_header: str = response.headers.get("Retry-After", "")
-            if retry_after_header.isdigit():
-                wait_seconds: int = int(retry_after_header)
-            else:
-                wait_seconds = 2 * (2 ** attempt)
-            time.sleep(min(wait_seconds, OPENSKY_MAX_BACKOFF_SEC))
+            # Don't sleep after the final attempt — we're about to give up anyway.
+            if attempt < OPENSKY_MAX_RETRIES - 1:
+                retry_after_header: str = response.headers.get("Retry-After", "")
+                if retry_after_header.isdigit():
+                    wait_seconds: int = int(retry_after_header)
+                else:
+                    wait_seconds = 2 * (2 ** attempt)
+                time.sleep(min(wait_seconds, OPENSKY_MAX_BACKOFF_SEC))
             continue
 
         response.raise_for_status()
