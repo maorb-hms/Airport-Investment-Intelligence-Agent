@@ -5,9 +5,10 @@ import json
 import csv
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import requests
 from math import radians, sin, cos, sqrt, atan2
+from dotenv import load_dotenv
 
 
 # Constants
@@ -35,14 +36,201 @@ METRO_ALIASES: Dict[str, str] = {
     "San Francisco": "KSFO",
 }
 
+# OpenSky Network API constants (data-and-apis.md §1)
+OPENSKY_AUTH_URL: str = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
+OPENSKY_API_BASE: str = "https://opensky-network.org/api"
+OPENSKY_CACHE_DIR: Path = CACHE_DIR / "opensky"
+OPENSKY_TOKEN_EXPIRY_BUFFER_SEC: int = 60  # Refresh token 60s before actual expiry
+STABLE_WINDOW_LAG_DAYS: int = 2  # Query windows must end at least this far in the past (data-and-apis.md §1.4)
+WINDOW_DAYS: int = 7  # KPI observation window length (scoring-and-kpis.md §0)
+MAX_API_INTERVAL_DAYS: int = 1  # OpenSky /flights/* hard limit per call (data-and-apis.md §1.2)
+
+# OpenSky OAuth2 client-credentials (from .env)
+load_dotenv()
+OPENSKY_CLIENT_ID: str = os.getenv("OPENSKY_CLIENT_ID", "")
+OPENSKY_CLIENT_SECRET: str = os.getenv("OPENSKY_CLIENT_SECRET", "")
+
+# In-memory token cache (data-and-apis.md §1.1: refresh on expiry or on 401)
+_cached_oauth_token: Optional[str] = None
+_token_expiry_time: Optional[datetime] = None
+
 
 def _ensure_cache_dir() -> None:
     """
     Create cache directories if they don't exist.
 
-    Ensures the OurAirports cache directory exists before any file I/O operations.
+    Ensures the OurAirports and OpenSky cache directories exist before any file I/O operations.
     """
     OURAIRPORTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    OPENSKY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _get_oauth_token() -> str:
+    """
+    Retrieve or refresh OAuth2 access token from OpenSky.
+
+    Uses in-memory caching with expiry tracking. Automatically refreshes on expiry or on 401.
+    Credentials are read from OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET (.env).
+
+    Returns:
+        OAuth2 access token (Bearer token).
+
+    Raises:
+        ValueError: If credentials are not set in .env.
+        requests.RequestException: If the token request fails.
+    """
+    global _cached_oauth_token, _token_expiry_time
+
+    # Check if cached token is still valid
+    if _cached_oauth_token is not None and _token_expiry_time is not None:
+        time_remaining: timedelta = _token_expiry_time - datetime.now()
+        is_token_valid: bool = time_remaining.total_seconds() > OPENSKY_TOKEN_EXPIRY_BUFFER_SEC
+        if is_token_valid:
+            return _cached_oauth_token
+
+    # Credentials not set
+    if not OPENSKY_CLIENT_ID or not OPENSKY_CLIENT_SECRET:
+        error_msg: str = "OpenSky credentials not set: add OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET to .env"
+        raise ValueError(error_msg)
+
+    # Request new token
+    token_request_data: Dict[str, str] = {
+        "grant_type": "client_credentials",
+        "client_id": OPENSKY_CLIENT_ID,
+        "client_secret": OPENSKY_CLIENT_SECRET,
+    }
+    token_response: requests.Response = requests.post(OPENSKY_AUTH_URL, data=token_request_data, timeout=30)
+    token_response.raise_for_status()
+
+    token_json: Dict[str, Any] = token_response.json()
+    access_token: str = token_json["access_token"]
+    expires_in_seconds: int = token_json["expires_in"]
+
+    # Cache token with expiry time
+    _cached_oauth_token = access_token
+    _token_expiry_time = datetime.now() + timedelta(seconds=expires_in_seconds)
+
+    return access_token
+
+
+def _get_opensky_flights(
+    icao: str, begin_unix: int, end_unix: int, kind: str
+) -> List[Dict[str, Any]]:
+    """
+    Fetch flights from OpenSky for a single day window.
+
+    Retrieves either departures or arrivals for a single airport within a 1-day window.
+    Responses are cached on disk (key: airport+window+kind) to avoid re-spending credits.
+    Handles 401 by refreshing the token and retrying.
+
+    Args:
+        icao: ICAO airport identifier (e.g., "KSFO").
+        begin_unix: Window start time in Unix epoch seconds.
+        end_unix: Window end time in Unix epoch seconds.
+        kind: "departure" or "arrival".
+
+    Returns:
+        List of flight records from the API response.
+
+    Raises:
+        ValueError: If kind is not "departure" or "arrival".
+        requests.RequestException: If the API request fails.
+    """
+    if kind not in ("departure", "arrival"):
+        error_msg: str = f"Invalid kind: '{kind}'; must be 'departure' or 'arrival'"
+        raise ValueError(error_msg)
+
+    # Build cache key: airport_window_kind (using Unix timestamps for uniqueness)
+    cache_key: str = f"{icao}_{begin_unix}_{end_unix}_{kind}"
+    cache_file_path: Path = OPENSKY_CACHE_DIR / f"{cache_key}.json"
+
+    # Check disk cache first
+    if cache_file_path.exists():
+        with open(cache_file_path, "r", encoding="utf-8") as f:
+            cached_flights: List[Dict[str, Any]] = json.load(f)
+            return cached_flights
+
+    # Build API request
+    api_endpoint: str = f"{OPENSKY_API_BASE}/flights/{kind}"
+    api_params: Dict[str, Any] = {
+        "airport": icao,
+        "begin": begin_unix,
+        "end": end_unix,
+    }
+
+    # Get token and make request
+    access_token: str = _get_oauth_token()
+    auth_headers: Dict[str, str] = {"Authorization": f"Bearer {access_token}"}
+
+    api_response: requests.Response = requests.get(
+        api_endpoint, params=api_params, headers=auth_headers, timeout=30
+    )
+
+    # Handle 401 by refreshing token and retrying
+    if api_response.status_code == 401:
+        global _cached_oauth_token, _token_expiry_time
+        _cached_oauth_token = None
+        _token_expiry_time = None
+        access_token = _get_oauth_token()
+        auth_headers = {"Authorization": f"Bearer {access_token}"}
+        api_response = requests.get(
+            api_endpoint, params=api_params, headers=auth_headers, timeout=30
+        )
+
+    api_response.raise_for_status()
+
+    # Parse response (array of flight objects or empty array)
+    flights: List[Dict[str, Any]] = api_response.json()
+    if not isinstance(flights, list):
+        flights = []
+
+    # Cache on disk for future requests
+    with open(cache_file_path, "w", encoding="utf-8") as f:
+        json.dump(flights, f)
+
+    return flights
+
+
+def get_flights(
+    icao: str, begin_unix: int, end_unix: int, kind: str
+) -> List[Dict[str, Any]]:
+    """
+    Fetch flights for a multi-day window by chunking into 1-day calls.
+
+    OpenSky's /flights/* endpoints reject intervals > 1 day (data-and-apis.md §1.2).
+    This function splits the requested window into consecutive 1-day chunks, fetches each,
+    and aggregates the results. Caching per chunk saves credits on overlapping queries.
+
+    Args:
+        icao: ICAO airport identifier (e.g., "KSFO").
+        begin_unix: Window start time in Unix epoch seconds.
+        end_unix: Window end time in Unix epoch seconds.
+        kind: "departure" or "arrival".
+
+    Returns:
+        Aggregated list of flight records across all chunks.
+
+    Raises:
+        ValueError: If kind is not "departure" or "arrival", or if window spans > ~2 months.
+        requests.RequestException: If any API request fails.
+    """
+    if kind not in ("departure", "arrival"):
+        error_msg: str = f"Invalid kind: '{kind}'; must be 'departure' or 'arrival'"
+        raise ValueError(error_msg)
+
+    seconds_per_day: int = 86400
+    all_flights: List[Dict[str, Any]] = []
+
+    # Chunk into 1-day windows and fetch each
+    current_begin: int = begin_unix
+    while current_begin < end_unix:
+        current_end: int = min(current_begin + seconds_per_day, end_unix)
+        day_flights: List[Dict[str, Any]] = _get_opensky_flights(icao, current_begin, current_end, kind)
+        all_flights.extend(day_flights)
+        current_begin = current_end
+
+    return all_flights
+
 
 
 def _is_cache_stale(cache_path: Path, max_age_days: int = OURAIRPORTS_REFRESH_DAYS) -> bool:
@@ -323,5 +511,24 @@ if __name__ == "__main__":
     try:
         sfo_capacity: Dict[str, Any] = runway_capacity("KSFO")
         pprint.pprint(sfo_capacity)
+    except Exception as e:
+        print(f"ERROR: {e}")
+
+    print("\n=== get_flights('KSFO', 1-day window ending STABLE_WINDOW_LAG_DAYS ago) ===")
+    try:
+        now_unix: int = int(datetime.now().timestamp())
+        window_end_unix: int = now_unix - (STABLE_WINDOW_LAG_DAYS * 86400)
+        window_begin_unix: int = window_end_unix - (MAX_API_INTERVAL_DAYS * 86400)
+
+        flights: List[Dict[str, Any]] = get_flights("KSFO", window_begin_unix, window_end_unix, "departure")
+        print(f"Fetched {len(flights)} KSFO departures")
+
+        if flights:
+            sample_flight: Dict[str, Any] = flights[0]
+            print("\nSample flight record:")
+            pprint.pprint(sample_flight)
+        else:
+            print("No flights returned (may be outside operating hours or network coverage)")
+
     except Exception as e:
         print(f"ERROR: {e}")
