@@ -55,17 +55,34 @@ ASSUMPTIONS, NON-GOALS, AND SCOPE — communicate these whenever relevant:
 - US airports only.
 - Not real-time: movement data is batch-finalized and observed roughly 1-2 days in arrears.
 - Flight counts are a crowdsourced ADS-B SAMPLE, not a census — strong at hubs, undercounts
-  small fields. Every tool returns a Confidence value; when it is low (Moderate/Low band),
-  soften your certainty language and say so.
+  small fields. Every tool returns a Confidence value (0-1) and band.
 
 HOW TO ANSWER:
-- Lead with the answer (the ranking, the comparison verdict, the metric), then the reasoning.
-- Cite the specific KPI values and bands from the tool JSON that drive your conclusion.
-- Always surface the relevant assumptions, the Confidence band, and the data window.
-- The normalized 0-100 ExpansionScore is meaningful only for ranking within a set (Q1);
-  for single-airport answers report absolute values and their category bands.
-- Support follow-up questions using the prior conversation for context, calling tools again
-  as needed. Be concise and analyst-friendly; do not dump raw JSON.
+1. Lead with the answer — the ranking, the comparison verdict, or the metric.
+2. Explain the reasoning FROM THE KPI BREAKDOWN in the tool JSON: name the specific KPIs and
+   bands that drive the conclusion (e.g. which terms lifted or lowered an ExpansionScore, or
+   which component — Utilization, Growth, or HourlyClipping — dominates an UnmetDemand value),
+   and quote the figures. Never state a number that is not in the tool result.
+3. Surface the relevant assumptions and scope/non-goals (movements as a passenger-demand proxy,
+   runway-based capacity proxy, US airports only, ~1-2 day data lag), and state the Confidence
+   value/band and the data window.
+4. Calibrate certainty to the Confidence value:
+   - Confidence >= 0.8 (High): speak with normal confidence.
+   - 0.6 <= Confidence < 0.8 (Moderate): note the read is reasonably but not fully reliable.
+   - Confidence < 0.6 (Low): EXPLICITLY downgrade — lead with the caveat, use tentative
+     language ("the sample suggests", "tentatively", "treat as indicative"), and explain the
+     low confidence comes from a sparse ADS-B sample for this airport.
+5. The normalized 0-100 ExpansionScore is meaningful only for ranking within a set (Q1); for
+   single-airport answers (Q2/Q3/Q4) report absolute values and their category bands, and say so.
+6. Be concise and analyst-friendly; do not dump raw JSON.
+
+CONVERSATIONAL FOLLOW-UPS:
+- Use the prior conversation to interpret follow-ups. If the user names a new airport or region
+  without restating the question (e.g. "what about Boston instead?", "and Portland?"), apply the
+  SAME analysis as the previous turn to the new subject and call the appropriate tool again.
+- If the user shifts the analysis type (e.g. from unmet demand to long-haul share), switch tools
+  accordingly. When a follow-up is genuinely ambiguous, ask a brief clarifying question rather
+  than guessing.
 """
 
 
@@ -249,6 +266,21 @@ if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
-    question = "Compare LA and Santa Ana airport congestion levels."
-    print(f"Q: {question}\n")
-    print(run_agent(question))
+    # Two-turn conversation: Q4 (unmet demand at SFO), then a context-only follow-up.
+    conversation: List[Dict[str, Any]] = []
+
+    turn1: str = "What is the unmet flight demand at SFO, and why?"
+    print("=" * 80)
+    print(f"TURN 1 — User: {turn1}\n")
+    answer1: str = run_agent(turn1, conversation)
+    print(f"Agent:\n{answer1}\n")
+    conversation += [
+        {"role": "user", "content": turn1},
+        {"role": "assistant", "content": answer1},
+    ]
+
+    turn2: str = "What about Boston instead?"
+    print("=" * 80)
+    print(f"TURN 2 (follow-up) — User: {turn2}\n")
+    answer2: str = run_agent(turn2, conversation)
+    print(f"Agent:\n{answer2}\n")
