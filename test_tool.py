@@ -1617,6 +1617,7 @@ def unmet_demand(icao: str) -> str:
             "utilization_clamped": _r(util_clamped),
             "growth": _r(bundle["growth"]),
             "growth_valid": bundle["growth_valid"],
+            "growth_period": f"recent vs. a baseline {BASELINE_LAG_DAYS} days earlier (a ~{BASELINE_LAG_DAYS // 30}-month trend, NOT year-over-year)",
             "hourly_clipping": _r(bundle["hourly_clipping"]),
             "peak_saturation": _r(bundle["peak_saturation"]),
             "peak_saturation_band": _band_peak_saturation(bundle["peak_saturation"]),
