@@ -1,0 +1,11 @@
+# Secrets — never commit real credentials
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local data cache (OurAirports CSVs + OpenSky responses)
+.cache/
