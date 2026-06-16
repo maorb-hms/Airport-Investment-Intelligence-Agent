@@ -28,6 +28,8 @@ OPENSKY_CLIENT_SECRET=...
 
 `begin`/`end` are Unix epoch seconds. Compute them from UTC.
 
+**VERIFIED interval limit:** a single `/flights/*` call must cover **≤ 1 day** — intervals of 2 days or more return **HTTP 400**. To build a `WINDOW_DAYS=7` observation window, `get_flights` must **fetch 7 consecutive 1-day calls and aggregate** (≈7 credits per airport per kind). Historical depth is ample (1-day windows at 30/90/180 days ago all return data), so the 90-day Growth baseline is retrievable.
+
 ### 1.3 Flight record fields (verified live)
 | Field | Used for |
 |---|---|
@@ -64,7 +66,13 @@ Pure reference data (airport identity, geography, runways). Carries **no demand 
 - `ident` / `iata_code` / `name` / `municipality` → resolve names ↔ ICAO (e.g. "Anchorage" → `PANC`) and produce human-readable explanations.
 - `iso_region` → region membership. **New England = `US-ME, US-NH, US-VT, US-MA, US-RI, US-CT`.**
 - `latitude_deg` / `longitude_deg` → great-circle distance for precise long-haul classification.
-- `type` + `scheduled_service` → filter to commercial airports (e.g. `type in {large_airport, medium_airport}` and `scheduled_service == "yes"`); exclude heliports/closed strips.
+- `type` + `scheduled_service` → **candidate universe** = `type in {large_airport, medium_airport}` AND `scheduled_service == "yes"`; heliports, closed strips, and small_airport are excluded (this filter is tunable).
+
+**Metro disambiguation rule (`resolve_airport`):** a metro name maps to multiple airports. Resolve a bare metro/city to its **primary commercial airport** (highest `type`/traffic) by default, state that assumption in the answer, and offer the alternatives. Required aliases for the canonical questions:
+- `"LA"` / `"Los Angeles"` → `KLAX` (alternatives: `KBUR`, `KLGB`, `KONT`)
+- `"Santa Ana"` → `KSNA`
+- `"Anchorage"` → `PANC`
+- `"SFO"` / `"San Francisco"` → `KSFO`
 
 ### 2.2 `runways.csv` — columns used
 `airport_ident`, `length_ft`, `width_ft`, `lighted`, `closed`.

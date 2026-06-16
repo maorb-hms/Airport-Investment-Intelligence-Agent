@@ -39,9 +39,11 @@ Combined deterministically to avoid hallucination. Full details in [`data-and-ap
 There is **no passenger/capacity API** — that gap is handled by proxies (§3).
 
 ## 5. Build milestones (commit after each verified step)
-Per [`architecture.md`](architecture.md) Version Control Rule. The prompt set in `prompts.md` drives these one at a time.
+Build them one at a time, committing after each verified step per [`architecture.md`](architecture.md) Version Control Rule.
 
-1. **Scaffold** — venv, `requirements.txt` (`streamlit`, `anthropic`, `requests`, `pandas`, `python-dotenv`), `.gitignore` (`.env`, `__pycache__`, data cache), `.env`, git init + first commit.
+1. **Scaffold** — venv, `requirements.txt` (`streamlit`, `anthropic`, `requests`, `pandas`, `python-dotenv`; **pin versions**), `.gitignore` (`.env`, `__pycache__`, data cache), `.env`, git init + first commit.
+
+> **Model choice:** default to **`claude-sonnet-4-6`** for the routing/explanation layer (fast, capable, cost-effective); use **`claude-opus-4-8`** if you want maximum reasoning quality. Pin the model id as a constant in `agent.py`.
 2. **Reference loader** (deterministic) — OurAirports runtime-refresh + cache; `resolve_airport`, `region_airports`, `runway_capacity`.
 3. **OpenSky client** (deterministic) — token caching + `get_flights` with on-disk response cache.
 4. **KPI functions** (deterministic) — the formulas in [`scoring-and-kpis.md`](scoring-and-kpis.md).
