@@ -49,7 +49,10 @@ OPENSKY_TOKEN_EXPIRY_BUFFER_SEC: int = 60
 OPENSKY_MAX_RETRIES: int = 3  # attempts on HTTP 429 (rate limit); kept low so a throttled airport fails fast for interactive queries
 OPENSKY_MAX_BACKOFF_SEC: int = 6  # cap per-retry sleep (seconds)
 OPENSKY_MAX_WORKERS: int = 10  # max concurrent OpenSky chunk fetches (bounds rate-limit pressure)
+OPENSKY_BREAKER_THRESHOLD: int = 5  # consecutive HTTP 429s that trip the rate-limit circuit breaker
+OPENSKY_BREAKER_COOLDOWN_SEC: int = 60  # while tripped, live fetches fail fast for this long
 RANK_GROWTH_TOP_K: int = 8  # rank_region computes the 90-day Growth baseline only for the top-K busiest candidates
+RANK_MAX_CANDIDATES: int = 10  # cap a region ranking to the N largest commercial airports (by runway capacity) to bound query cost
 STABLE_WINDOW_LAG_DAYS: int = 2
 WINDOW_DAYS: int = 7
 MAX_API_INTERVAL_DAYS: int = 1
@@ -74,6 +77,12 @@ OPENSKY_CLIENT_SECRET: str = os.getenv("OPENSKY_CLIENT_SECRET", "")
 _cached_oauth_token: Optional[str] = None
 _token_expiry_time: Optional[datetime] = None
 _token_lock: threading.Lock = threading.Lock()  # serialize token refresh across concurrent fetches
+
+# Rate-limit circuit breaker: after OPENSKY_BREAKER_THRESHOLD consecutive 429s, fail live
+# fetches fast for OPENSKY_BREAKER_COOLDOWN_SEC so a throttled query can't grind for minutes.
+_breaker_lock: threading.Lock = threading.Lock()
+_consecutive_429: int = 0
+_breaker_open_until: float = 0.0  # time.monotonic() seconds; > now means the breaker is open
 
 
 def _ensure_cache_dir() -> None:
@@ -157,10 +166,17 @@ def _opensky_get(endpoint: str, params: Dict[str, Any]) -> requests.Response:
     Raises:
         requests.RequestException: If the request still fails after retries.
     """
-    global _cached_oauth_token, _token_expiry_time
+    global _cached_oauth_token, _token_expiry_time, _consecutive_429, _breaker_open_until
 
     last_response: Optional[requests.Response] = None
     for attempt in range(OPENSKY_MAX_RETRIES):
+        # Circuit breaker: after sustained throttling, fail fast instead of grinding.
+        with _breaker_lock:
+            if time.monotonic() < _breaker_open_until:
+                raise requests.RequestException(
+                    "OpenSky is rate-limiting (circuit breaker open); skipping live fetch"
+                )
+
         access_token: str = _get_oauth_token()
         auth_headers: Dict[str, str] = {"Authorization": f"Bearer {access_token}"}
         response: requests.Response = requests.get(endpoint, params=params, headers=auth_headers, timeout=30)
@@ -173,6 +189,10 @@ def _opensky_get(endpoint: str, params: Dict[str, Any]) -> requests.Response:
             continue
 
         if response.status_code == 429:
+            with _breaker_lock:
+                _consecutive_429 += 1
+                if _consecutive_429 >= OPENSKY_BREAKER_THRESHOLD:
+                    _breaker_open_until = time.monotonic() + OPENSKY_BREAKER_COOLDOWN_SEC
             # Don't sleep after the final attempt — we're about to give up anyway.
             if attempt < OPENSKY_MAX_RETRIES - 1:
                 retry_after_header: str = response.headers.get("Retry-After", "")
@@ -184,6 +204,10 @@ def _opensky_get(endpoint: str, params: Dict[str, Any]) -> requests.Response:
             continue
 
         response.raise_for_status()
+        # Success — close the breaker.
+        with _breaker_lock:
+            _consecutive_429 = 0
+            _breaker_open_until = 0.0
         return response
 
     # Retries exhausted — raise on the last response.
@@ -1263,10 +1287,24 @@ def rank_region(region_codes: Any) -> str:
     region_set: set[str] = set(region_codes)
     candidates: List[Dict[str, Any]] = region_airports(region_set)
 
+    # Cap the set to the largest commercial airports (by runway capacity — CSV-only, no API)
+    # so a region with many small fields doesn't fan out into hundreds of OpenSky calls.
+    region_airports_total: int = len(candidates)
+    if region_airports_total > RANK_MAX_CANDIDATES:
+        candidates = sorted(
+            candidates, key=lambda a: capacity_index(a["ident"]), reverse=True
+        )[:RANK_MAX_CANDIDATES]
+
     recent_begin, recent_end = _recent_window()
     baseline: tuple[int, int] = _baseline_window(recent_end)
 
     notes: List[str] = []
+    if region_airports_total > len(candidates):
+        notes.append(
+            f"Scope: ranked the {len(candidates)} largest commercial airports in the region "
+            f"(by runway capacity) out of {region_airports_total}; smaller fields were omitted "
+            "to keep the analysis fast."
+        )
 
     def _aggregate(
         chunk_results: Dict[ChunkTask, List[Dict[str, Any]]], icao: str, chunks: List[Tuple[int, int]]
@@ -1414,10 +1452,22 @@ def rank_region(region_codes: Any) -> str:
     for position, item in enumerate(ranked, start=1):
         item["rank"] = position
 
+    # If no airport returned any movements, live data was unavailable (e.g. throttled) —
+    # flag it prominently so the ranking isn't presented as meaningful.
+    total_movements: int = sum(b["departures"] + b["arrivals"] for b in bundles)
+    data_available: bool = total_movements > 0
+    if not data_available:
+        notes.insert(0, (
+            "Live flight activity could not be retrieved for any airport in this set right now "
+            "(the data source is rate-limiting). The ranking is not meaningful — please try again shortly."
+        ))
+
     output: Dict[str, Any] = {
         "question": "Q1 — regional ranking (terminal-expansion candidates)",
         "method": "Min-max normalize each KPI across the set, then weighted sum (scoring-and-kpis.md §8).",
         "region_codes": sorted(region_set),
+        "data_available": data_available,
+        "region_airports_total": region_airports_total,
         "candidate_count": len(candidates),
         "base_weights": base_weights,
         "set_has_growth": len(growth_values) > 0,
@@ -1590,6 +1640,85 @@ def unmet_demand(icao: str) -> str:
         "confidence_caveat": CONFIDENCE_CAVEAT,
         "scope": "Single-airport proxy — absolute value + band; not normalized.",
         "notes": bundle["errors"],
+    }
+    return json.dumps(output, indent=2)
+
+
+def list_airports(
+    region_codes: Optional[Any] = None,
+    name_query: Optional[str] = None,
+    limit: int = 50,
+) -> str:
+    """
+    List or search the US commercial airports available for analysis (directory lookup).
+
+    Pure reference data from OurAirports — NO flight API calls, so it is instant and never
+    rate-limited. Filters to US large/medium airports with scheduled service (the analyzable
+    universe), optionally narrowed by ISO region codes and/or a case-insensitive name/city/
+    code substring. Results are ordered largest-type-first then alphabetically and truncated
+    to `limit`. Returns strict JSON.
+
+    Args:
+        region_codes: Optional iterable of ISO 3166-2 region codes (e.g. ["US-MA"]).
+        name_query: Optional substring matched against name, municipality, IATA, or ICAO.
+        limit: Maximum airports to return (default 50).
+
+    Returns:
+        JSON string with the matching airports' identities and the total match count.
+    """
+    airports: List[Dict[str, Any]] = _load_airports()
+    region_set: Optional[set[str]] = set(region_codes) if region_codes else None
+    query_lower: str = name_query.strip().lower() if name_query else ""
+
+    matches: List[Dict[str, Any]] = []
+    for airport in airports:
+        if airport.get("iso_country") != "US":
+            continue
+        if airport.get("type") not in CANDIDATE_AIRPORT_TYPES:
+            continue
+        if airport.get("scheduled_service") != CANDIDATE_SCHEDULED_SERVICE:
+            continue
+        if region_set is not None and airport.get("iso_region") not in region_set:
+            continue
+        if query_lower:
+            haystack: str = " ".join([
+                airport.get("name", ""), airport.get("municipality", ""),
+                airport.get("iata_code", ""), airport.get("ident", ""),
+            ]).lower()
+            if query_lower not in haystack:
+                continue
+        matches.append(airport)
+
+    type_rank: Dict[str, int] = {"large_airport": 0, "medium_airport": 1}
+    matches.sort(key=lambda a: (type_rank.get(a.get("type", ""), 2), a.get("name", "")))
+
+    match_count: int = len(matches)
+    listed: List[Dict[str, Any]] = [
+        {**_airport_identity(a), "type": a.get("type", "")} for a in matches[:limit]
+    ]
+
+    notes: List[str] = []
+    if match_count > len(listed):
+        notes.append(
+            f"{match_count} airports match; showing the first {len(listed)}. "
+            "Narrow by region or name to see the rest."
+        )
+
+    output: Dict[str, Any] = {
+        "query": {
+            "region_codes": sorted(region_set) if region_set else None,
+            "name_query": name_query,
+            "limit": limit,
+        },
+        "match_count": match_count,
+        "returned": len(listed),
+        "airports": listed,
+        "scope": (
+            "US airports with scheduled commercial service (large/medium) from the OurAirports "
+            "reference directory. This is the analyzable universe — reference identities only, "
+            "no flight activity."
+        ),
+        "notes": notes,
     }
     return json.dumps(output, indent=2)
 
