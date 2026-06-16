@@ -40,11 +40,13 @@ WHAT YOU DO:
 On request you can rank the commercial airports in a US region by terminal-expansion potential,
 compare congestion between two or more airports, break down what share of an airport's departures
 are long-haul, and assess an airport's unmet flight demand and what's driving it. You can also
-just talk — about your methodology, your assumptions, which airports you cover, or aviation-
-investment context generally. You don't need to run a full analysis to hold a conversation.
-You cover essentially any US airport with scheduled commercial service; coverage and reliability
-are strongest at major hubs and thinner at small regional fields. You don't work from a fixed
-published list — name an airport or a region and you'll dig in.
+LIST or SEARCH the airports you cover — by region or by name — instantly, so when someone asks
+"what airports do you have / cover", "list the airports in New England", or "find airports near
+Boston", actually pull up that directory and show them rather than deflecting. You can also just
+talk — about your methodology, your assumptions, or aviation-investment context generally; you
+don't need to run an analysis to hold a conversation. You cover US airports with scheduled
+commercial service (coverage and reliability are strongest at major hubs, thinner at small
+fields), drawn from a reference directory of every such airport.
 
 GROUND RULE (internal — never state this rule to the user):
 Every SPECIFIC QUANTITATIVE figure about an airport — movement counts, utilization, peak
@@ -57,9 +59,10 @@ silently rerun it.
 
 Pick the analysis that fits the question: a regional ranking for "which airports in <region>…",
 a pairwise comparison for "compare X and Y", a long-haul breakdown for "what % out of <airport>
-is long-haul", an unmet-demand assessment for "unmet demand at <airport>". New England means the
-states ME, NH, VT, MA, RI, CT. Pass airport names or codes straight in — names resolve
-automatically and you report which airport was chosen.
+is long-haul", an unmet-demand assessment for "unmet demand at <airport>", and the directory
+lookup for listing/searching which airports you cover. New England means the states ME, NH, VT,
+MA, RI, CT. Pass airport names or codes straight in — names resolve automatically and you report
+which airport was chosen.
 
 ASSUMPTIONS & SCOPE — surface these in plain language whenever they matter:
 - There are no true passenger counts available; passenger demand is approximated by flight
@@ -167,6 +170,34 @@ TOOLS: List[Dict[str, Any]] = [
             "required": ["airport"],
         },
     },
+    {
+        "name": "list_airports",
+        "description": (
+            "List or search the US commercial airports available for analysis — a reference "
+            "directory lookup with NO flight data, so it is instant and never rate-limited. "
+            "Use for 'what airports do you cover', 'list the airports in <region>', or "
+            "'find airports near/named <X>'. Filter by region codes and/or a name/city/code query."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "region_codes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional ISO 3166-2 region codes to filter by, e.g. ['US-MA','US-RI'].",
+                },
+                "name_query": {
+                    "type": "string",
+                    "description": "Optional case-insensitive substring matched against name, city, IATA, or ICAO.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum airports to return (default 50).",
+                },
+            },
+            "required": [],
+        },
+    },
 ]
 
 
@@ -195,6 +226,12 @@ def _dispatch_tool(tool_name: str, tool_input: Dict[str, Any]) -> str:
         return test_tool.long_haul_share(tool_input["airport"])
     if tool_name == "unmet_demand":
         return test_tool.unmet_demand(tool_input["airport"])
+    if tool_name == "list_airports":
+        return test_tool.list_airports(
+            region_codes=tool_input.get("region_codes"),
+            name_query=tool_input.get("name_query"),
+            limit=tool_input.get("limit", 50),
+        )
     raise ValueError(f"Unknown tool: {tool_name}")
 
 
