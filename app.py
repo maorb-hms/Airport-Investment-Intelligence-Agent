@@ -46,25 +46,6 @@ with st.sidebar:
     )
     st.caption('Follow-ups work too — e.g. "What about Boston instead?"')
 
-    st.header("🎙️ Voice (optional)")
-    st.caption("Record a question instead of typing. Falls back to text if unavailable.")
-    voice_text = None
-    audio_value = st.audio_input("Ask by voice", label_visibility="collapsed")
-    if audio_value is not None:
-        # Only transcribe a freshly recorded clip once (the widget returns the same
-        # audio on every rerun until it's cleared).
-        audio_bytes = audio_value.getvalue()
-        audio_id = hash(audio_bytes)
-        if st.session_state.get("last_audio_id") != audio_id:
-            st.session_state.last_audio_id = audio_id
-            with st.spinner("Transcribing…"):
-                voice_text = _transcribe(audio_bytes)
-            if voice_text is None:
-                st.info(
-                    "Voice transcription isn't available right now — type your "
-                    "question below instead. (Install `SpeechRecognition` to enable it.)"
-                )
-
     if st.button("Clear conversation"):
         st.session_state.messages = []
         st.session_state.pop("last_audio_id", None)
@@ -79,21 +60,54 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# Capture input and delegate to the routing agent — no logic happens here.
-# A transcribed voice question (if any) flows through the same path as typed text.
-user_input = st.chat_input("Ask about an airport or region…") or voice_text
-if user_input:
-    with st.chat_message("user"):
-        st.markdown(user_input)
+# Input row: a mic button next to the input bar. Clicking it toggles the bar between
+# typing (st.chat_input) and recording (st.audio_input) — voice is a non-blocking
+# enhancement that always falls back to text (architecture.md §1).
+if "voice_mode" not in st.session_state:
+    st.session_state.voice_mode = False
 
-    # History passed to the agent is every prior turn (not including this new message);
-    # run_agent appends the new user message itself.
+voice_text = None
+user_input = None
+
+mic_col, bar_col = st.columns([1, 11], vertical_alignment="bottom")
+with mic_col:
+    toggle_icon = "⌨️" if st.session_state.voice_mode else "🎙️"
+    toggle_help = "Switch to typing" if st.session_state.voice_mode else "Ask by voice"
+    if st.button(toggle_icon, help=toggle_help, use_container_width=True):
+        st.session_state.voice_mode = not st.session_state.voice_mode
+        st.rerun()
+
+with bar_col:
+    if st.session_state.voice_mode:
+        audio_value = st.audio_input("Ask by voice", label_visibility="collapsed")
+        if audio_value is not None:
+            # Only transcribe a freshly recorded clip once (the widget returns the
+            # same audio on every rerun until it's cleared).
+            audio_bytes = audio_value.getvalue()
+            audio_id = hash(audio_bytes)
+            if st.session_state.get("last_audio_id") != audio_id:
+                st.session_state.last_audio_id = audio_id
+                with st.spinner("Transcribing…"):
+                    voice_text = _transcribe(audio_bytes)
+                if voice_text is None:
+                    st.info(
+                        "Couldn't transcribe that — try again, or tap ⌨️ to type."
+                    )
+    else:
+        user_input = st.chat_input("Ask about an airport or region…")
+
+# Delegate to the routing agent — no logic happens here. A transcribed voice
+# question (if any) flows through the same path as typed text.
+user_input = user_input or voice_text
+if user_input:
+    # History passed to the agent is every prior turn (not including this new message).
     prior_history = list(st.session_state.messages)
     st.session_state.messages.append({"role": "user", "content": user_input})
 
-    with st.chat_message("assistant"):
-        with st.spinner("Analyzing…"):
-            answer = run_agent(user_input, prior_history)
-        st.markdown(answer)
-
+    with st.spinner("Analyzing…"):
+        answer = run_agent(user_input, prior_history)
     st.session_state.messages.append({"role": "assistant", "content": answer})
+
+    # Rerun so the new exchange renders in the history above, keeping the input
+    # row pinned below the conversation.
+    st.rerun()
