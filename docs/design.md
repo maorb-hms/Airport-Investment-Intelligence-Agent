@@ -41,7 +41,7 @@ There is **no passenger/capacity API** — that gap is handled by proxies (§3).
 ## 5. Build milestones (commit after each verified step)
 Build them one at a time, committing after each verified step per [`architecture.md`](architecture.md) Version Control Rule.
 
-1. **Scaffold** — venv, `requirements.txt` (`streamlit`, `anthropic`, `requests`, `pandas`, `python-dotenv`; **pin versions**), `.gitignore` (`.env`, `__pycache__`, data cache), `.env`, git init + first commit.
+1. **Scaffold** — venv, `requirements.txt` (`streamlit`, `anthropic`, `requests`, `python-dotenv`, and `SpeechRecognition` for bonus voice input; **pin versions**), `.gitignore` (`.env`, `__pycache__`, data cache), `.env`, git init + first commit. (CSV parsing uses the stdlib `csv` module — no `pandas` needed.)
 
 > **Model choice:** default to **`claude-sonnet-4-6`** for the routing/explanation layer (fast, capable, cost-effective); use **`claude-opus-4-8`** if you want maximum reasoning quality. Pin the model id as a constant in `agent.py`.
 2. **Reference loader** (deterministic) — OurAirports runtime-refresh + cache; `resolve_airport`, `region_airports`, `runway_capacity`.
