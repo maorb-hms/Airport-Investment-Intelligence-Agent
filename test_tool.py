@@ -11,7 +11,7 @@ from math import radians, sin, cos, sqrt, atan2
 from dotenv import load_dotenv
 
 
-# Constants
+# ===== Cache & Data Source Constants =====
 CACHE_DIR: Path = Path(".cache")
 OURAIRPORTS_CACHE_DIR: Path = CACHE_DIR / "ourairports"
 OURAIRPORTS_REFRESH_DAYS: int = 7
@@ -40,10 +40,21 @@ METRO_ALIASES: Dict[str, str] = {
 OPENSKY_AUTH_URL: str = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
 OPENSKY_API_BASE: str = "https://opensky-network.org/api"
 OPENSKY_CACHE_DIR: Path = CACHE_DIR / "opensky"
-OPENSKY_TOKEN_EXPIRY_BUFFER_SEC: int = 60  # Refresh token 60s before actual expiry
-STABLE_WINDOW_LAG_DAYS: int = 2  # Query windows must end at least this far in the past (data-and-apis.md §1.4)
-WINDOW_DAYS: int = 7  # KPI observation window length (scoring-and-kpis.md §0)
-MAX_API_INTERVAL_DAYS: int = 1  # OpenSky /flights/* hard limit per call (data-and-apis.md §1.2)
+OPENSKY_TOKEN_EXPIRY_BUFFER_SEC: int = 60
+STABLE_WINDOW_LAG_DAYS: int = 2
+WINDOW_DAYS: int = 7
+MAX_API_INTERVAL_DAYS: int = 1
+
+# ===== KPI Tunable Constants (scoring-and-kpis.md §0) =====
+RUNWAY_THROUGHPUT_PER_HOUR: int = 30  # movements/hr for one runway
+OPERATING_HOURS: int = 18  # active hours/day
+LONGRUNWAY_SHORT_FT: int = 6000  # below = small-aircraft only
+LONGRUNWAY_HEAVY_FT: int = 9000  # above = efficiently handles heavies
+LENGTH_FACTOR: Dict[str, float] = {"short": 0.7, "normal": 1.0, "heavy": 1.1}
+LONG_HAUL_MIN_KM: float = 4000.0  # great-circle distance threshold for "long-haul"
+LONG_HAUL_MIN_MINUTES: int = 360  # duration fallback when coords unavailable
+BASELINE_LAG_DAYS: int = 90  # Growth baseline ends this many days before the current window
+CONFIDENCE_PENALTY_ON_GROWTH_NULL: float = 0.85  # penalty when baseline is empty
 
 # OpenSky OAuth2 client-credentials (from .env)
 load_dotenv()
@@ -485,50 +496,467 @@ def runway_capacity(icao: str) -> Dict[str, Any]:
     return capacity_result
 
 
+# ===== KPI Functions (scoring-and-kpis.md §1–§7) =====
+
+def traffic_volume(flights: List[Dict[str, Any]], window_days: int) -> float:
+    """
+    Compute average daily movements (departures + arrivals) over a window.
+
+    Args:
+        flights: Combined list of departure and arrival flight records.
+        window_days: Number of days in the observation window.
+
+    Returns:
+        Average movements per day; 0.0 if window_days <= 0.
+    """
+    if window_days <= 0:
+        return 0.0
+    total_movements: int = len(flights)
+    return total_movements / window_days
+
+
+def peak_load(flights: List[Dict[str, Any]]) -> int:
+    """
+    Find the maximum movements in any single clock hour.
+
+    Departures count in the hour of firstSeen; arrivals in the hour of lastSeen.
+    Both are combined per clock-hour to yield movements_in_hour.
+    PeakLoad is the maximum observed.
+
+    Args:
+        flights: Combined list of departure and arrival flight records.
+
+    Returns:
+        Maximum movements observed in any clock hour across the window.
+    """
+    hourly_movements: Dict[int, int] = {}
+
+    for flight_record in flights:
+        first_seen_unix: int = flight_record.get("firstSeen", 0)
+        last_seen_unix: int = flight_record.get("lastSeen", 0)
+
+        if first_seen_unix > 0:
+            first_seen_hour: int = first_seen_unix // 3600
+            hourly_movements[first_seen_hour] = hourly_movements.get(first_seen_hour, 0) + 1
+
+        if last_seen_unix > 0:
+            last_seen_hour: int = last_seen_unix // 3600
+            hourly_movements[last_seen_hour] = hourly_movements.get(last_seen_hour, 0) + 1
+
+    if not hourly_movements:
+        return 0
+
+    return max(hourly_movements.values())
+
+
+def distinct_destinations(departures: List[Dict[str, Any]]) -> int:
+    """
+    Count unique destination airports.
+
+    Args:
+        departures: List of departure flight records.
+
+    Returns:
+        Number of distinct estArrivalAirport codes.
+    """
+    destinations: set[str] = set()
+    for departure_record in departures:
+        destination_airport: str = departure_record.get("estArrivalAirport", "")
+        if destination_airport:
+            destinations.add(destination_airport)
+
+    return len(destinations)
+
+
+def capacity_index(icao: str) -> float:
+    """
+    Compute maximum movements per day (CapacityIndex).
+
+    Formula: count(usable_runways) × RUNWAY_THROUGHPUT_PER_HOUR × OPERATING_HOURS × length_factor
+    where length_factor depends on the longest runway length.
+
+    Args:
+        icao: ICAO airport identifier.
+
+    Returns:
+        Maximum movements per day; 0.0 if airport not found or has no usable runways.
+    """
+    try:
+        capacity_metrics: Dict[str, Any] = runway_capacity(icao)
+    except (ValueError, Exception):
+        return 0.0
+
+    usable_runway_count: int = capacity_metrics["usable_runway_count"]
+    longest_ft: int = capacity_metrics["longest_ft"]
+
+    if longest_ft < LONGRUNWAY_SHORT_FT:
+        factor: float = LENGTH_FACTOR["short"]
+    elif longest_ft >= LONGRUNWAY_HEAVY_FT:
+        factor = LENGTH_FACTOR["heavy"]
+    else:
+        factor = LENGTH_FACTOR["normal"]
+
+    capacity_val: float = usable_runway_count * RUNWAY_THROUGHPUT_PER_HOUR * OPERATING_HOURS * factor
+    return capacity_val
+
+
+def hourly_capacity(icao: str) -> float:
+    """
+    Compute maximum movements per hour (HourlyCapacity).
+
+    Formula: count(usable_runways) × RUNWAY_THROUGHPUT_PER_HOUR × length_factor
+
+    Args:
+        icao: ICAO airport identifier.
+
+    Returns:
+        Maximum movements per hour; 0.0 if airport not found.
+    """
+    try:
+        capacity_metrics: Dict[str, Any] = runway_capacity(icao)
+    except (ValueError, Exception):
+        return 0.0
+
+    usable_runway_count: int = capacity_metrics["usable_runway_count"]
+    longest_ft: int = capacity_metrics["longest_ft"]
+
+    if longest_ft < LONGRUNWAY_SHORT_FT:
+        factor = LENGTH_FACTOR["short"]
+    elif longest_ft >= LONGRUNWAY_HEAVY_FT:
+        factor = LENGTH_FACTOR["heavy"]
+    else:
+        factor = LENGTH_FACTOR["normal"]
+
+    hourly_cap: float = usable_runway_count * RUNWAY_THROUGHPUT_PER_HOUR * factor
+    return hourly_cap
+
+
+def utilization(traffic_vol: float, capacity_idx: float) -> float:
+    """
+    Compute utilization ratio (TrafficVolume / CapacityIndex).
+
+    Args:
+        traffic_vol: TrafficVolume (movements/day).
+        capacity_idx: CapacityIndex (max movements/day).
+
+    Returns:
+        Utilization ratio; 0.0 if capacity <= 0.
+    """
+    if capacity_idx <= 0:
+        return 0.0
+    return traffic_vol / capacity_idx
+
+
+def peak_saturation(peak_load_val: int, hourly_cap: float) -> float:
+    """
+    Compute peak saturation ratio (PeakLoad / HourlyCapacity).
+
+    Args:
+        peak_load_val: PeakLoad (movements in busiest hour).
+        hourly_cap: HourlyCapacity (max movements/hour).
+
+    Returns:
+        Peak saturation ratio; 0.0 if hourly_cap <= 0.
+    """
+    if hourly_cap <= 0:
+        return 0.0
+    return peak_load_val / hourly_cap
+
+
+def long_haul_share(departures: List[Dict[str, Any]], origin_icao: str) -> tuple[float, Dict[str, Any]]:
+    """
+    Compute fraction of long-haul departures.
+
+    For each departure, classify as long-haul using:
+    - Distance-based (if both airports resolve): great_circle_km >= LONG_HAUL_MIN_KM
+    - Duration fallback (if coords unavailable): (lastSeen - firstSeen) / 60 >= LONG_HAUL_MIN_MINUTES
+
+    Args:
+        departures: List of departure flight records.
+        origin_icao: Origin airport ICAO (for context).
+
+    Returns:
+        Tuple of (long_haul_fraction, breakdown_dict) where breakdown_dict contains:
+        - long_haul_distance_count: flights classified by distance
+        - long_haul_duration_count: flights classified by duration
+        - usable_flights: departures with identifiable signals
+    """
+    airports: List[Dict[str, Any]] = _load_airports()
+    airport_dict: Dict[str, Dict[str, Any]] = {a["ident"]: a for a in airports}
+
+    origin_airport: Optional[Dict[str, Any]] = airport_dict.get(origin_icao)
+    origin_lat: float = float(origin_airport["latitude_deg"]) if origin_airport else 0.0
+    origin_lon: float = float(origin_airport["longitude_deg"]) if origin_airport else 0.0
+
+    long_haul_distance_count: int = 0
+    long_haul_duration_count: int = 0
+    usable_flights: int = 0
+
+    for departure_record in departures:
+        dest_airport_code: str = departure_record.get("estArrivalAirport", "")
+        first_seen: int = departure_record.get("firstSeen", 0)
+        last_seen: int = departure_record.get("lastSeen", 0)
+
+        if not dest_airport_code or first_seen <= 0 or last_seen <= 0:
+            continue
+
+        usable_flights += 1
+
+        dest_airport: Optional[Dict[str, Any]] = airport_dict.get(dest_airport_code)
+        if dest_airport and origin_airport:
+            try:
+                dest_lat: float = float(dest_airport["latitude_deg"])
+                dest_lon: float = float(dest_airport["longitude_deg"])
+                distance_km: float = _great_circle_distance(origin_lat, origin_lon, dest_lat, dest_lon)
+                if distance_km >= LONG_HAUL_MIN_KM:
+                    long_haul_distance_count += 1
+                    continue
+            except (ValueError, Exception):
+                pass
+
+        duration_minutes: int = (last_seen - first_seen) // 60
+        if duration_minutes >= LONG_HAUL_MIN_MINUTES:
+            long_haul_duration_count += 1
+
+    long_haul_fraction: float = 0.0
+    if usable_flights > 0:
+        total_long_haul: int = long_haul_distance_count + long_haul_duration_count
+        long_haul_fraction = total_long_haul / usable_flights
+
+    breakdown: Dict[str, Any] = {
+        "long_haul_distance_count": long_haul_distance_count,
+        "long_haul_duration_count": long_haul_duration_count,
+        "usable_flights": usable_flights,
+    }
+
+    return long_haul_fraction, breakdown
+
+
+def compute_growth(
+    recent_flights: List[Dict[str, Any]],
+    baseline_flights: List[Dict[str, Any]],
+    window_days: int,
+) -> tuple[Optional[float], bool]:
+    """
+    Compute growth rate between two windows.
+
+    Growth = (recent_TrafficVolume - baseline_TrafficVolume) / baseline_TrafficVolume
+    If baseline is empty, return (None, False) — drop Growth term from scoring.
+
+    Args:
+        recent_flights: Recent observation window flights.
+        baseline_flights: Baseline window flights (BASELINE_LAG_DAYS earlier).
+        window_days: Window size in days.
+
+    Returns:
+        Tuple of (growth_rate, is_valid) where:
+        - growth_rate: Computed growth or None if baseline is empty
+        - is_valid: True if both windows have data; False if baseline is empty
+    """
+    recent_volume: float = traffic_volume(recent_flights, window_days)
+    baseline_volume: float = traffic_volume(baseline_flights, window_days)
+
+    if baseline_volume <= 0:
+        return None, False
+
+    growth_rate: float = (recent_volume - baseline_volume) / baseline_volume
+    return growth_rate, True
+
+
+def hourly_clipping(flights: List[Dict[str, Any]], hourly_cap: float) -> float:
+    """
+    Compute fraction of operating hours where movements >= 0.9 × HourlyCapacity.
+
+    Args:
+        flights: Combined list of flights.
+        hourly_cap: HourlyCapacity for the airport.
+
+    Returns:
+        Fraction of operating hours at >= 90% capacity; 0.0 if hourly_cap <= 0.
+    """
+    if hourly_cap <= 0:
+        return 0.0
+
+    hourly_movements: Dict[int, int] = {}
+
+    for flight_record in flights:
+        first_seen_unix: int = flight_record.get("firstSeen", 0)
+        last_seen_unix: int = flight_record.get("lastSeen", 0)
+
+        if first_seen_unix > 0:
+            first_seen_hour: int = first_seen_unix // 3600
+            hourly_movements[first_seen_hour] = hourly_movements.get(first_seen_hour, 0) + 1
+
+        if last_seen_unix > 0:
+            last_seen_hour: int = last_seen_unix // 3600
+            hourly_movements[last_seen_hour] = hourly_movements.get(last_seen_hour, 0) + 1
+
+    if not hourly_movements:
+        return 0.0
+
+    clipping_threshold: float = 0.9 * hourly_cap
+    clipped_hours: int = sum(1 for movements in hourly_movements.values() if movements >= clipping_threshold)
+    total_hours: int = len(hourly_movements)
+
+    clipping_fraction: float = clipped_hours / total_hours if total_hours > 0 else 0.0
+    return clipping_fraction
+
+
+def unmet_demand(utilization_val: float, growth_rate: Optional[float], hourly_clipping_val: float) -> float:
+    """
+    Compute unmet demand proxy.
+
+    Formula: util_clamped × max(0, Growth) + HourlyClipping
+    where util_clamped = min(Utilization, 1.0)
+
+    Args:
+        utilization_val: Utilization ratio.
+        growth_rate: Growth rate or None if baseline empty.
+        hourly_clipping_val: HourlyClipping fraction.
+
+    Returns:
+        UnmetDemand proxy value.
+    """
+    util_clamped: float = min(utilization_val, 1.0)
+    growth_component: float = max(0.0, growth_rate) if growth_rate is not None else 0.0
+    unmet_demand_val: float = util_clamped * growth_component + hourly_clipping_val
+    return unmet_demand_val
+
+
+def confidence_score(flights: List[Dict[str, Any]]) -> float:
+    """
+    Compute confidence as fraction of flights with valid airport estimates.
+
+    Args:
+        flights: Combined list of flights.
+
+    Returns:
+        Fraction in [0, 1]; 1.0 if all have non-null est*Airport, 0.0 if none do.
+    """
+    if not flights:
+        return 0.0
+
+    valid_flights: int = 0
+    for flight_record in flights:
+        has_dep_airport: bool = bool(flight_record.get("estDepartureAirport"))
+        has_arr_airport: bool = bool(flight_record.get("estArrivalAirport"))
+        if has_dep_airport and has_arr_airport:
+            valid_flights += 1
+
+    confidence_val: float = valid_flights / len(flights)
+    return confidence_val
+
+
 if __name__ == "__main__":
     import pprint
 
-    print("\n=== resolve_airport('Anchorage') ===")
-    try:
-        anchorage_result: Dict[str, Any] = resolve_airport("Anchorage")
-        pprint.pprint(anchorage_result)
-    except Exception as e:
-        print(f"ERROR: {e}")
+    print("\n" + "=" * 70)
+    print("KPI COMPUTATION TEST: KLAX (Los Angeles International)")
+    print("=" * 70)
 
-    print("\n=== region_airports(NEW_ENGLAND_REGIONS) ===")
+    # Resolve the airport
+    print("\n[1] Resolving airport...")
     try:
-        ne_airports: List[Dict[str, Any]] = region_airports(NEW_ENGLAND_REGIONS)
-        print(f"Found {len(ne_airports)} New England candidate airports:")
-        for airport_record in ne_airports:
-            airport_icao: str = airport_record["ident"]
-            airport_name: str = airport_record["name"]
-            airport_municipality: str = airport_record["municipality"]
-            print(f"  {airport_icao:6s} {airport_name:50s} ({airport_municipality})")
+        klax_airport: Dict[str, Any] = resolve_airport("LA")
+        print(f"    ICAO: {klax_airport['ident']}")
+        print(f"    Name: {klax_airport['name']}")
+        print(f"    Region: {klax_airport['iso_region']}")
     except Exception as e:
-        print(f"ERROR: {e}")
+        print(f"    ERROR resolving airport: {e}")
+        exit(1)
 
-    print("\n=== runway_capacity('KSFO') ===")
+    klax_icao: str = klax_airport["ident"]
+
+    # Get runway capacity
+    print("\n[2] Computing runway capacity...")
     try:
-        sfo_capacity: Dict[str, Any] = runway_capacity("KSFO")
-        pprint.pprint(sfo_capacity)
+        klax_runway_cap: Dict[str, Any] = runway_capacity(klax_icao)
+        print(f"    Usable runways: {klax_runway_cap['usable_runway_count']}")
+        print(f"    Longest runway: {klax_runway_cap['longest_ft']} ft")
     except Exception as e:
-        print(f"ERROR: {e}")
+        print(f"    ERROR: {e}")
+        exit(1)
 
-    print("\n=== get_flights('KSFO', 1-day window ending STABLE_WINDOW_LAG_DAYS ago) ===")
+    # Fetch flights (1-day recent window)
+    print(f"\n[3] Fetching flights (1-day recent window ending {STABLE_WINDOW_LAG_DAYS} days ago)...")
+    print("    (Requires OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET in .env)")
     try:
         now_unix: int = int(datetime.now().timestamp())
         window_end_unix: int = now_unix - (STABLE_WINDOW_LAG_DAYS * 86400)
         window_begin_unix: int = window_end_unix - (MAX_API_INTERVAL_DAYS * 86400)
 
-        flights: List[Dict[str, Any]] = get_flights("KSFO", window_begin_unix, window_end_unix, "departure")
-        print(f"Fetched {len(flights)} KSFO departures")
+        departures: List[Dict[str, Any]] = get_flights(klax_icao, window_begin_unix, window_end_unix, "departure")
+        arrivals: List[Dict[str, Any]] = get_flights(klax_icao, window_begin_unix, window_end_unix, "arrival")
+        all_flights: List[Dict[str, Any]] = departures + arrivals
 
-        if flights:
-            sample_flight: Dict[str, Any] = flights[0]
-            print("\nSample flight record:")
-            pprint.pprint(sample_flight)
-        else:
-            print("No flights returned (may be outside operating hours or network coverage)")
+        print(f"    Departures: {len(departures)}")
+        print(f"    Arrivals: {len(arrivals)}")
+        print(f"    Total movements: {len(all_flights)}")
 
-    except Exception as e:
-        print(f"ERROR: {e}")
+    except (ValueError, requests.exceptions.RequestException) as e:
+        print(f"    ERROR (network/credentials): {e}")
+        print("    Skipping live data; using mock data for KPI demonstration...")
+        mock_dep: Dict[str, Any] = {
+            "firstSeen": window_begin_unix + 10000,
+            "lastSeen": window_begin_unix + 20000,
+            "estDepartureAirport": "KLAX",
+            "estArrivalAirport": "KORD",
+        }
+        departures = [mock_dep] * 100
+        arrivals = [mock_dep] * 80
+        all_flights = departures + arrivals
+
+    # Compute KPIs
+    print("\n[4] Computing KPIs...")
+    tv: float = traffic_volume(all_flights, 1)
+    pl: int = peak_load(all_flights)
+    dd: int = distinct_destinations(departures)
+    ci: float = capacity_index(klax_icao)
+    hc: float = hourly_capacity(klax_icao)
+    util: float = utilization(tv, ci)
+    ps: float = peak_saturation(pl, hc)
+    lhs: float
+    lhs_breakdown: Dict[str, Any]
+    lhs, lhs_breakdown = long_haul_share(departures, klax_icao)
+    hc_val: float = hourly_clipping(all_flights, hc)
+    ud: float = unmet_demand(util, None, hc_val)
+    conf: float = confidence_score(all_flights)
+
+    # Display results
+    print("\n" + "=" * 70)
+    print("KPI RESULTS FOR KLAX")
+    print("=" * 70)
+    print(f"\nDemand KPIs (OpenSky window):")
+    print(f"  TrafficVolume:           {tv:10.2f} movements/day")
+    print(f"  PeakLoad:                {pl:10d} movements/hour (busiest hour)")
+    print(f"  DistinctDestinations:    {dd:10d} unique destination airports")
+
+    print(f"\nCapacity KPIs (OurAirports runways):")
+    print(f"  CapacityIndex:           {ci:10.2f} max movements/day")
+    print(f"  HourlyCapacity:          {hc:10.2f} max movements/hour")
+
+    print(f"\nCongestion KPIs:")
+    print(f"  Utilization:             {util:10.4f} ({util*100:6.2f}%)")
+    print(f"  PeakSaturation:          {ps:10.4f} ({ps*100:6.2f}%)")
+    print(f"  HourlyClipping (>90%):   {hc_val:10.4f} ({hc_val*100:6.2f}%)")
+
+    print(f"\nLong-haul & Growth:")
+    print(f"  LongHaulShare:           {lhs:10.4f} ({lhs*100:6.2f}%)")
+    print(f"    - Distance-based:      {lhs_breakdown['long_haul_distance_count']:6d} flights")
+    print(f"    - Duration-based:      {lhs_breakdown['long_haul_duration_count']:6d} flights")
+    print(f"  Growth (vs. 90d ago):    (null baseline in 1-day demo)")
+
+    print(f"\nProxies & Confidence:")
+    print(f"  UnmetDemand:             {ud:10.4f}")
+    print(f"  Confidence:              {conf:10.4f} ({conf*100:6.2f}%)")
+
+    print(f"\nTunable Constants (auditable assumptions):")
+    print(f"  RUNWAY_THROUGHPUT_PER_HOUR: {RUNWAY_THROUGHPUT_PER_HOUR}")
+    print(f"  OPERATING_HOURS:            {OPERATING_HOURS}")
+    print(f"  LONG_HAUL_MIN_KM:           {LONG_HAUL_MIN_KM}")
+    print(f"  BASELINE_LAG_DAYS:          {BASELINE_LAG_DAYS}")
+    print(f"  WINDOW_DAYS:                {WINDOW_DAYS}")
+
+    print("\n" + "=" * 70)
+    print("Reference: data-and-apis.md §1.5 baseline for LAX 1-day window = ~1,553 movements")
+    print("=" * 70 + "\n")
