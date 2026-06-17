@@ -1,5 +1,10 @@
 # ✈️ Airport Investment Intelligence Agent
 
+> ## 📋 Reviewers — start here
+> **Assignment deliverables write-up** (source code, scoring methodology, key tradeoffs, where/how AI is used):
+> - 🇬🇧 **[deliverables/deliverables-english.md](deliverables/deliverables-english.md)**
+> - 🇮🇱 **[deliverables/deliverables-hebrew.md](deliverables/deliverables-hebrew.md)** (עברית)
+
 An interactive AI agent that helps a firm investing in **US airport modernization /
 terminal-expansion** projects find the airports where renovation will be most profitable —
 judged by rising flight demand pressing against available capacity.
