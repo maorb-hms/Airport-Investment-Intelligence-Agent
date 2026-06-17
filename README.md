@@ -59,6 +59,22 @@ streamlit run app.py
 
 This launches the chat UI in your browser (default `http://localhost:8501`).
 
+## Tests
+
+The deterministic scoring engine is covered by a `pytest` suite (`tests/test_scoring.py`).
+The tests are hermetic — both data sources (OurAirports CSVs and the OpenSky API) are
+monkeypatched with small fixtures, so they run offline and fast, with no API credits spent.
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+They cover the KPI math (traffic, utilization, peak saturation, growth, hourly clipping,
+unmet-demand, confidence), the capacity formula's runway-length factors, long-haul
+classification (distance + duration fallback), airport name resolution, and the composite
+`ExpansionScore` ranking end-to-end (offline).
+
 ## Overview & documentation
 
 The codebase follows a strict **3-tier architecture**: a Streamlit presentation layer

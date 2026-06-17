@@ -7,5 +7,8 @@ __pycache__/
 .venv/
 venv/
 
+# Test cache
+.pytest_cache/
+
 # Local data cache (OurAirports CSVs + OpenSky responses)
 .cache/
