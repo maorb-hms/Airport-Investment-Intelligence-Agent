@@ -10,5 +10,8 @@ venv/
 # Test cache
 .pytest_cache/
 
+# Editor / IDE
+.vscode/
+
 # Local data cache (OurAirports CSVs + OpenSky responses)
 .cache/
