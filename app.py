@@ -105,7 +105,15 @@ if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
 
     with st.spinner("Analyzing…"):
-        answer = run_agent(user_input, prior_history)
+        # run_agent already degrades known failures to friendly messages; this is a final
+        # safety net so no unexpected error can ever surface a raw traceback in the UI.
+        try:
+            answer = run_agent(user_input, prior_history)
+        except Exception:
+            answer = (
+                "Sorry — something went wrong on my end while processing that. "
+                "Please try again in a moment."
+            )
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
     # Rerun so the new exchange renders in the history above, keeping the input

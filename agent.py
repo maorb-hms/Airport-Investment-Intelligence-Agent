@@ -257,13 +257,42 @@ def run_agent(user_message: str, history: Optional[List[Dict[str, Any]]] = None)
     messages.append({"role": "user", "content": user_message})
 
     for _ in range(MAX_TOOL_ROUNDS):
-        response = _client.messages.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages,
-        )
+        # The model call is the one external dependency that can fail outright (no network,
+        # bad/missing key, rate limit, server error). Catch it and degrade gracefully to a
+        # plain-language message instead of letting a traceback reach the UI.
+        try:
+            response = _client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=SYSTEM_PROMPT,
+                tools=TOOLS,
+                messages=messages,
+            )
+        except anthropic.APIConnectionError:
+            return (
+                "I'm having trouble reaching my analysis service right now — it looks like a "
+                "network issue. Please check the connection and try again in a moment."
+            )
+        except anthropic.RateLimitError:
+            return (
+                "I'm getting a lot of requests at the moment and need a short breather. "
+                "Please wait a few seconds and try again."
+            )
+        except anthropic.AuthenticationError:
+            return (
+                "I can't connect to my analysis service right now — it looks like a "
+                "configuration issue on my end. Please try again later."
+            )
+        except anthropic.APIError:
+            return (
+                "Something went wrong while I was working on that — my analysis service "
+                "returned an error. Please try again shortly."
+            )
+        except Exception:
+            return (
+                "Sorry, something unexpected went wrong while I was processing that. "
+                "Please try again in a moment."
+            )
 
         if response.stop_reason != "tool_use":
             # Final answer — return the model's text.
